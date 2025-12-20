@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Check arguments
 if [ "$#" -lt 2 ]; then
