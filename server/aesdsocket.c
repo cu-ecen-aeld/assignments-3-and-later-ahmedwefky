@@ -10,9 +10,28 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
+
+/* Thread data structure */
+typedef struct thread_data_s
+{
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr_in client_addr;
+    int thread_complete;
+    SLIST_ENTRY(thread_data_s) entries;
+} thread_data_t;
 
 /* Global variable to indicate if a signal was caught */
 volatile sig_atomic_t caught_signal = 0;
+
+/* Mutex for file synchronization */
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Linked list head */
+SLIST_HEAD(thread_list, thread_data_s) head;
 
 /* Signal handler function */
 void signal_handler(int signo)
@@ -25,26 +44,145 @@ void signal_handler(int signo)
     }
 }
 
-int main(int argc, char *argv[])
+/* Timestamp thread function */
+void *timestamp_thread(void *arg)
 {
-    int server_fd;
-    int client_fd;
-    struct sockaddr_in server_addr;    
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    struct sigaction sa;
-    char ip_str[INET_ADDRSTRLEN];
+    (void)arg;
+    time_t now;
+    struct tm tm_info;
+    char time_str[128];
     FILE *fp;
-    FILE *read_fp;
-    char send_buf[1024];
-    size_t bytes_read;
+    int i;
+    
+    while (!caught_signal)
+    {
+        /* Wait 10 seconds, checking for signal every 100ms */
+        for (i = 0; i < 100; i++)
+        {
+            if (caught_signal)
+            {
+                break;
+            }
+            
+            usleep(100000);
+        }
+
+        if (caught_signal)
+        {
+            break;
+        }
+
+        now = time(NULL);
+        localtime_r(&now, &tm_info);
+        strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %T %z\n", &tm_info);
+
+        pthread_mutex_lock(&file_mutex);
+        fp = fopen("/var/tmp/aesdsocketdata", "a");
+        if (fp != NULL)
+        {
+            if (fputs(time_str, fp) == EOF)
+            {
+                syslog(LOG_ERR, "write timestamp failed");
+            }
+            fclose(fp);
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
+}
+
+/* Connection handling thread function */
+void *connection_handler(void *arg)
+{
+    thread_data_t *data = (thread_data_t *)arg;
+    int client_fd = data->client_fd;
+    char ip_str[INET_ADDRSTRLEN];
+    char recv_buf[1024];
     char *buf = NULL;
     size_t buf_len = 0;
-    char recv_buf[1024];    
     ssize_t bytes_received;
     char *new_buf;
     char *newline_ptr;
     size_t packet_length;
+    FILE *fp;
+    FILE *read_fp;
+    char send_buf[1024];
+    size_t bytes_read;
+
+    inet_ntop(AF_INET, &data->client_addr.sin_addr, ip_str, sizeof(ip_str));
+    syslog(LOG_INFO, "Accepted connection from %s", ip_str);
+
+    while ((bytes_received = recv(client_fd, recv_buf, sizeof(recv_buf), 0)) > 0)
+    {
+        new_buf = realloc(buf, buf_len + bytes_received);
+        if (new_buf == NULL)
+        {
+            syslog(LOG_ERR, "realloc failed");
+            if (buf) free(buf);
+            buf = NULL;
+            buf_len = 0;
+            break;
+        }
+        buf = new_buf;
+        memcpy(buf + buf_len, recv_buf, bytes_received);
+        buf_len += bytes_received;
+
+        while ((newline_ptr = memchr(buf, '\n', buf_len)) != NULL)
+        {
+            packet_length = newline_ptr - buf + 1;
+
+            pthread_mutex_lock(&file_mutex);
+            fp = fopen("/var/tmp/aesdsocketdata", "a");
+            if (fp != NULL)
+            {
+                if (fwrite(buf, 1, packet_length, fp) != packet_length)
+                {
+                    syslog(LOG_ERR, "fwrite failed");
+                }
+                fclose(fp);
+            }
+            pthread_mutex_unlock(&file_mutex);
+
+            read_fp = fopen("/var/tmp/aesdsocketdata", "r");
+            if (read_fp != NULL)
+            {
+                while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), read_fp)) > 0)
+                {
+                    if (send(client_fd, send_buf, bytes_read, 0) == -1)
+                    {
+                        syslog(LOG_ERR, "send failed");
+                        break;
+                    }
+                }
+                fclose(read_fp);
+            }
+
+            memmove(buf, newline_ptr + 1, buf_len - packet_length);
+            buf_len -= packet_length;
+        }
+    }
+
+    if (buf)
+    {
+        free(buf);
+    }
+    syslog(LOG_INFO, "Closed connection from %s", ip_str);
+    close(client_fd);
+    data->thread_complete = 1;
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    int server_fd;
+    struct sockaddr_in server_addr;    
+    struct sigaction sa;
+    pthread_t timer_thread;
+    thread_data_t *entry = NULL;
+    thread_data_t *cur;
+    thread_data_t *prev;    
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len;
 
     /* Open the system log */
     openlog("aesdsocket", LOG_PID, LOG_USER);
@@ -99,6 +237,14 @@ int main(int argc, char *argv[])
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
     {
         perror("bind");
+        close(server_fd);
+        return -1;
+    }
+
+    /* Start listening for connections with a backlog of 1 to allow 1 client at a time */
+    if (listen(server_fd, 1) == -1)
+    {
+        perror("listen");
         close(server_fd);
         return -1;
     }
@@ -160,122 +306,117 @@ int main(int argc, char *argv[])
         /* This ensures that future sockets and files get unique descriptors starting from 3 */
     }
 
-    /* Start listening for connections with a backlog of 1 to allow 1 client at a time */
-    if (listen(server_fd, 1) == -1)
+    printf("Server listening on port 9000\n");
+
+    /* Initialize list head */
+    SLIST_INIT(&head);
+
+    /* Start timestamp thread */
+    if (pthread_create(&timer_thread, NULL, timestamp_thread, NULL) != 0)
     {
-        perror("listen");
+        syslog(LOG_ERR, "Failed to create timestamp thread");
         close(server_fd);
         return -1;
     }
 
-    printf("Server listening on port 9000\n");
-
     /* Loop until a signal is caught */
     while (!caught_signal)
     {
+        client_addr_len = sizeof(client_addr);
+        
         /* Accept a new connection */
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
         if (client_fd == -1)
         {
-            perror("accept error");
+            if (errno != EINTR)
+            {
+                perror("accept error");
+            }
             continue;
         }
         
-        /* Convert client IP address to string */
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
-        
-        /* Log accepted connection */
-        syslog(LOG_INFO, "Accepted connection from %s", ip_str);
-
-        /* Loop to receive data from client */
-        while ((bytes_received = recv(client_fd, recv_buf, sizeof(recv_buf), 0)) > 0)
+        /* Create thread data */
+        thread_data_t *new_thread = malloc(sizeof(thread_data_t));
+        if (new_thread == NULL)
         {
-            /* Reallocate buffer to accommodate new data */
-            new_buf = realloc(buf, buf_len + bytes_received);
-            
-            /* Check if reallocation failed */
-            if (new_buf == NULL)
+            syslog(LOG_ERR, "malloc failed");
+            close(client_fd);
+            continue;
+        }
+        new_thread->client_fd = client_fd;
+        new_thread->client_addr = client_addr;
+        new_thread->thread_complete = 0;
+
+        /* Insert into list */
+        SLIST_INSERT_HEAD(&head, new_thread, entries);
+
+        /* Create thread */
+        if (pthread_create(&new_thread->thread_id, NULL, connection_handler, (void *)new_thread) != 0)
+        {
+            syslog(LOG_ERR, "pthread_create failed");
+            close(client_fd);
+            SLIST_REMOVE(&head, new_thread, thread_data_s, entries);
+            free(new_thread);
+            continue;
+        }
+        
+        /* Cleanup completed threads */
+        cur = SLIST_FIRST(&head);
+        prev = NULL;
+        while (cur != NULL)
+        {
+            if (cur->thread_complete)
             {
-                syslog(LOG_ERR, "realloc failed");
-                if (buf)
+                pthread_join(cur->thread_id, NULL);
+                if (prev == NULL)
                 {
-                    free(buf);
-                    buf = NULL;
+                    SLIST_REMOVE_HEAD(&head, entries);
+                    free(cur);
+                    cur = SLIST_FIRST(&head);
                 }
-                buf_len = 0;
-                break;
+                else
+                {
+                    SLIST_REMOVE(&head, cur, thread_data_s, entries);
+                    free(cur);
+                    cur = SLIST_NEXT(prev, entries);
+                }
             }
-            buf = new_buf;
-            
-            /* Copy received data to dynamic buffer */
-            memcpy(buf + buf_len, recv_buf, bytes_received);
-            
-            /* Update buffer length */
-            buf_len += bytes_received;            
-            
-            /* Check for a complete packet in the buffer */
-            if ((newline_ptr = memchr(buf, '\n', buf_len)) != NULL)
+            else
             {
-                /* Calculate length of the packet */
-                packet_length = newline_ptr - buf + 1;
-                
-                /* Open file for appending */
-                fp = fopen("/var/tmp/aesdsocketdata", "a");
-                
-                /* Check if file opened successfully */
-                if (fp != NULL)
-                {
-                    if (fwrite(buf, 1, packet_length, fp) != packet_length)
-                    {
-                        syslog(LOG_ERR, "fwrite failed");
-                    }
-                    fclose(fp);
-                }
-
-                /* Open file for reading to send back content */
-                read_fp = fopen("/var/tmp/aesdsocketdata", "r");
-                
-                /* Check if file opened successfully */
-                if (read_fp != NULL)
-                {
-                    /* Read file in chunks */
-                    while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), read_fp)) > 0)
-                    {
-                        /* Send chunk to client */
-                        if (send(client_fd, send_buf, bytes_read, 0) == -1)
-                        {
-                            syslog(LOG_ERR, "send failed");
-                        }
-                    }
-                    fclose(read_fp);
-                }
-
-                /* Move remaining data to the beginning of the buffer */
-                memmove(buf, newline_ptr + 1, buf_len - packet_length);
-                /* Update buffer length */
-                buf_len -= packet_length;
+                prev = cur;
+                cur = SLIST_NEXT(cur, entries);
             }
         }
-
-        if (buf)
-        {
-            free(buf);
-            buf = NULL;
-        }
-        buf_len = 0;
-        
-        syslog(LOG_INFO, "Closed connection from %s", ip_str);
-        close(client_fd);
     }
 
     /* Check if loop exited due to a signal */
     if (caught_signal)
     {
         syslog(LOG_INFO, "Caught signal, exiting");
+        
+        /* Wait for the timestamp thread to exit */
+        pthread_join(timer_thread, NULL);
+
+        /* Request exit from all threads */
+        SLIST_FOREACH(entry, &head, entries)
+        {
+            shutdown(entry->client_fd, SHUT_RDWR);
+        }
+
+        /* Join all threads */
+        while (!SLIST_EMPTY(&head))
+        {
+            entry = SLIST_FIRST(&head);
+            pthread_join(entry->thread_id, NULL);
+            SLIST_REMOVE_HEAD(&head, entries);
+            free(entry);
+        }
+
         remove("/var/tmp/aesdsocketdata");
     }
 
     closelog();
     close(server_fd);
+    pthread_mutex_destroy(&file_mutex);
     return EXIT_SUCCESS;
 }
