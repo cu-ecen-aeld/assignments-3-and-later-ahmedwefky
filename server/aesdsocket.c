@@ -14,6 +14,16 @@
 #include <sys/queue.h>
 #include <time.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE == 1
+#define AESD_DATA_FILE "/dev/aesdchar"
+#else
+#define AESD_DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 /* Thread data structure */
 typedef struct thread_data_s
 {
@@ -45,6 +55,7 @@ void signal_handler(int signo)
 }
 
 /* Timestamp thread function */
+#if USE_AESD_CHAR_DEVICE == 0
 void *timestamp_thread(void *arg)
 {
     (void)arg;
@@ -77,7 +88,7 @@ void *timestamp_thread(void *arg)
         strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %T %z\n", &tm_info);
 
         pthread_mutex_lock(&file_mutex);
-        fp = fopen("/var/tmp/aesdsocketdata", "a");
+        fp = fopen(AESD_DATA_FILE, "a");
         if (fp != NULL)
         {
             if (fputs(time_str, fp) == EOF)
@@ -90,6 +101,7 @@ void *timestamp_thread(void *arg)
     }
     return NULL;
 }
+#endif
 
 /* Connection handling thread function */
 void *connection_handler(void *arg)
@@ -132,7 +144,7 @@ void *connection_handler(void *arg)
             packet_length = newline_ptr - buf + 1;
 
             pthread_mutex_lock(&file_mutex);
-            fp = fopen("/var/tmp/aesdsocketdata", "a");
+            fp = fopen(AESD_DATA_FILE, "a");
             if (fp != NULL)
             {
                 if (fwrite(buf, 1, packet_length, fp) != packet_length)
@@ -143,7 +155,7 @@ void *connection_handler(void *arg)
             }
             pthread_mutex_unlock(&file_mutex);
 
-            read_fp = fopen("/var/tmp/aesdsocketdata", "r");
+            read_fp = fopen(AESD_DATA_FILE, "r");
             if (read_fp != NULL)
             {
                 while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), read_fp)) > 0)
@@ -177,7 +189,9 @@ int main(int argc, char *argv[])
     int server_fd;
     struct sockaddr_in server_addr;    
     struct sigaction sa;
+#if USE_AESD_CHAR_DEVICE == 0
     pthread_t timer_thread;
+#endif
     thread_data_t *entry = NULL;
     thread_data_t *cur;
     thread_data_t *prev;    
@@ -312,12 +326,14 @@ int main(int argc, char *argv[])
     SLIST_INIT(&head);
 
     /* Start timestamp thread */
+#if USE_AESD_CHAR_DEVICE == 0
     if (pthread_create(&timer_thread, NULL, timestamp_thread, NULL) != 0)
     {
         syslog(LOG_ERR, "Failed to create timestamp thread");
         close(server_fd);
         return -1;
     }
+#endif
 
     /* Loop until a signal is caught */
     while (!caught_signal)
@@ -395,7 +411,9 @@ int main(int argc, char *argv[])
         syslog(LOG_INFO, "Caught signal, exiting");
         
         /* Wait for the timestamp thread to exit */
+#if USE_AESD_CHAR_DEVICE == 0
         pthread_join(timer_thread, NULL);
+#endif
 
         /* Request exit from all threads */
         SLIST_FOREACH(entry, &head, entries)
@@ -412,7 +430,9 @@ int main(int argc, char *argv[])
             free(entry);
         }
 
-        remove("/var/tmp/aesdsocketdata");
+#if USE_AESD_CHAR_DEVICE == 0
+        remove(AESD_DATA_FILE);
+#endif
     }
 
     closelog();
