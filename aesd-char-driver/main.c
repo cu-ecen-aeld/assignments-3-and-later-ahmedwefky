@@ -21,6 +21,7 @@
 #include <linux/slab.h> // krealloc, kfree
 #include <linux/string.h> // memchr
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -187,6 +188,126 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     return retval;
 }
 
+/* Seek to a position in the concatenated circular buffer data */
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t new_pos;
+    loff_t size = 0;
+    struct aesd_buffer_entry *entry;
+    uint8_t index;
+
+    /* Lock the device mutex preventing race conditions while seeking */
+    if (mutex_lock_interruptible(&dev->lock))
+    {
+        /* Return error if the lock acquisition is interrupted by a signal */
+        return -ERESTARTSYS;
+    }
+
+    /* Calculate the total size of data in the circular buffer */
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index)
+    {
+        size += entry->size;
+    }
+
+    /* Use the fixed_size_llseek helper to perform the seek operation */
+    new_pos = fixed_size_llseek(filp, offset, whence, size);
+
+    /* Unlock the device mutex */
+    mutex_unlock(&dev->lock);
+    return new_pos;
+}
+
+/* Handle ioctl commands for the aesdchar driver */
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    int retval = 0;
+    struct aesd_seekto seekto;
+    struct aesd_dev *dev = filp->private_data;
+    uint8_t entry_count;
+    uint8_t i;
+    uint8_t index;
+    loff_t offset = 0;
+
+    /* Validate the ioctl command */
+    if ((_IOC_TYPE(cmd) != AESD_IOC_MAGIC) || (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR))
+    {
+        return -ENOTTY;
+    }
+
+    switch (cmd)
+    {
+        case AESDCHAR_IOCSEEKTO:
+            /* Copy the seekto structure from user space */
+            if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)))
+            {
+                /* Return error if copy_from_user fails */
+                retval = -EFAULT;
+            }
+            else
+            {
+                /* Lock the device mutex preventing race conditions while seeking */
+                if (mutex_lock_interruptible(&dev->lock))
+                {
+                    /* Return error if the lock acquisition is interrupted by a signal */
+                    return -ERESTARTSYS;
+                }
+
+                /* Determine the number of valid entries in the circular buffer */
+                if (dev->buffer.full)
+                {
+                    /* All entries are valid */
+                    entry_count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                }
+                else if (dev->buffer.in_offs >= dev->buffer.out_offs)
+                {
+                    /* Entries from out_offs to in_offs are valid */
+                    entry_count = dev->buffer.in_offs - dev->buffer.out_offs;
+                }
+                else
+                {
+                    /* Entries from out_offs to end and from beginning to in_offs are valid */
+                    entry_count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED + dev->buffer.in_offs - dev->buffer.out_offs;
+                }
+
+                /* Validate the requested write_cmd */
+                if (seekto.write_cmd >= entry_count)
+                {
+                    /* Invalid write_cmd */
+                    retval = -EINVAL;
+                }
+                else
+                {
+                    index = dev->buffer.out_offs;
+                    /* Calculate the byte offset corresponding to the requested write_cmd and write_cmd_offset */
+                    for (i = 0; i < seekto.write_cmd; i++)
+                    {
+                        offset += dev->buffer.entry[index].size;
+                        index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                    }
+
+                    /* Validate the requested write_cmd_offset */
+                    if (seekto.write_cmd_offset >= dev->buffer.entry[index].size)
+                    {
+                        retval = -EINVAL;
+                    }
+                    else
+                    {
+                        offset += seekto.write_cmd_offset;
+                        filp->f_pos = offset;
+                        retval = 0;
+                    }
+                }
+                mutex_unlock(&dev->lock);
+            }
+            break;
+        default:
+            retval = -ENOTTY;
+            break;
+    }
+    return retval;
+}
+
 struct file_operations aesd_fops =
 {
     .owner =    THIS_MODULE,
@@ -194,6 +315,8 @@ struct file_operations aesd_fops =
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)

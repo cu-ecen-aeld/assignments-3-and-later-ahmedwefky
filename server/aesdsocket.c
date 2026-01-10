@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <sys/queue.h>
 #include <time.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -142,31 +143,77 @@ void *connection_handler(void *arg)
         while ((newline_ptr = memchr(buf, '\n', buf_len)) != NULL)
         {
             packet_length = newline_ptr - buf + 1;
+            struct aesd_seekto seekto;
+            int is_ioctl = 0;
 
-            pthread_mutex_lock(&file_mutex);
-            fp = fopen(AESD_DATA_FILE, "a");
-            if (fp != NULL)
+            if (strncmp(buf, "AESDCHAR_IOCSEEKTO:", 19) == 0)
             {
-                if (fwrite(buf, 1, packet_length, fp) != packet_length)
+                char *cmd_str = malloc(packet_length + 1);
+                if (cmd_str)
                 {
-                    syslog(LOG_ERR, "fwrite failed");
-                }
-                fclose(fp);
-            }
-            pthread_mutex_unlock(&file_mutex);
-
-            read_fp = fopen(AESD_DATA_FILE, "r");
-            if (read_fp != NULL)
-            {
-                while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), read_fp)) > 0)
-                {
-                    if (send(client_fd, send_buf, bytes_read, 0) == -1)
+                    unsigned int cmd, offset;
+                    memcpy(cmd_str, buf, packet_length);
+                    cmd_str[packet_length] = '\0';
+                    if (sscanf(cmd_str, "AESDCHAR_IOCSEEKTO:%u,%u", &cmd, &offset) == 2)
                     {
-                        syslog(LOG_ERR, "send failed");
-                        break;
+                        seekto.write_cmd = cmd;
+                        seekto.write_cmd_offset = offset;
+                        is_ioctl = 1;
                     }
+                    free(cmd_str);
                 }
-                fclose(read_fp);
+            }
+
+            if (is_ioctl)
+            {
+                fp = fopen(AESD_DATA_FILE, "r");
+                if (fp != NULL)
+                {
+                    if (ioctl(fileno(fp), AESDCHAR_IOCSEEKTO, &seekto) != 0)
+                    {
+                        syslog(LOG_ERR, "ioctl failed");
+                    }
+                    else
+                    {
+                        while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), fp)) > 0)
+                        {
+                            if (send(client_fd, send_buf, bytes_read, 0) == -1)
+                            {
+                                syslog(LOG_ERR, "send failed");
+                                break;
+                            }
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+            else
+            {
+                pthread_mutex_lock(&file_mutex);
+                fp = fopen(AESD_DATA_FILE, "a");
+                if (fp != NULL)
+                {
+                    if (fwrite(buf, 1, packet_length, fp) != packet_length)
+                    {
+                        syslog(LOG_ERR, "fwrite failed");
+                    }
+                    fclose(fp);
+                }
+                pthread_mutex_unlock(&file_mutex);
+
+                read_fp = fopen(AESD_DATA_FILE, "r");
+                if (read_fp != NULL)
+                {
+                    while ((bytes_read = fread(send_buf, 1, sizeof(send_buf), read_fp)) > 0)
+                    {
+                        if (send(client_fd, send_buf, bytes_read, 0) == -1)
+                        {
+                            syslog(LOG_ERR, "send failed");
+                            break;
+                        }
+                    }
+                    fclose(read_fp);
+                }
             }
 
             memmove(buf, newline_ptr + 1, buf_len - packet_length);
